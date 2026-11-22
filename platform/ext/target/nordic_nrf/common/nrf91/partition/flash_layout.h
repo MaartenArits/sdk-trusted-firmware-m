@@ -143,20 +143,21 @@
 #define MCUBOOT_STATUS_MAX_ENTRIES      (0)
 
 
-/* Protected Storage (PS) Service definitions */
-#define FLASH_PS_AREA_OFFSET            (FLASH_AREA_SCRATCH_OFFSET + \
-                                         FLASH_AREA_SCRATCH_SIZE)
-#define FLASH_PS_AREA_SIZE              (0x4000)   /* 16 KB */
+/* TF-M storage areas. The chain fixes these addresses; they must match the
+ * NS partition table in boot/app_v341/boards/*_ns_tfm.overlay:
+ *   0x000f0000 PS  8 KB
+ *   0x000f2000 ITS 16 KB
+ *   0x000f6000 OTP 8 KB
+ *   0x000f8000 storage (B0/NS settings, 32 KB)
+ */
+#define FLASH_PS_AREA_OFFSET            (0x000f0000)
+#define FLASH_PS_AREA_SIZE              (0x2000)   /* 8 KB */
 
-/* Internal Trusted Storage (ITS) Service definitions */
-#define FLASH_ITS_AREA_OFFSET           (FLASH_PS_AREA_OFFSET + \
-                                         FLASH_PS_AREA_SIZE)
-#define FLASH_ITS_AREA_SIZE             (0x2000)   /* 8 KB */
+#define FLASH_ITS_AREA_OFFSET           (0x000f2000)
+#define FLASH_ITS_AREA_SIZE             (0x4000)   /* 16 KB */
 
-/* OTP_definitions */
-#define FLASH_OTP_NV_COUNTERS_AREA_OFFSET (FLASH_ITS_AREA_OFFSET + \
-                                           FLASH_ITS_AREA_SIZE)
-#define FLASH_OTP_NV_COUNTERS_AREA_SIZE   (FLASH_AREA_IMAGE_SECTOR_SIZE * 2)
+#define FLASH_OTP_NV_COUNTERS_AREA_OFFSET (0x000f6000)
+#define FLASH_OTP_NV_COUNTERS_AREA_SIZE   (0x2000) /* 8 KB */
 #define FLASH_OTP_NV_COUNTERS_SECTOR_SIZE FLASH_AREA_IMAGE_SECTOR_SIZE
 
 /* Non-secure storage region */

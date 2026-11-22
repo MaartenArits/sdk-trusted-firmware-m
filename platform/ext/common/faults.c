@@ -11,6 +11,8 @@
 /* "exception_info.h" must be the last include because of the IAR pragma */
 #include "exception_info.h"
 
+void rtc_wdt_security_fault(uint32_t fault_addr);
+
 void C_HardFault_Handler(void)
 {
     /* A HardFault may indicate corruption of secure state, so it is essential
@@ -60,6 +62,7 @@ void C_BusFault_Handler(void)
      * Returning from this exception could allow a pending NS exception to be
      * taken, so the current solution is to panic.
      */
+    rtc_wdt_security_fault(SCB->BFAR);
     tfm_core_panic();
 }
 
@@ -81,6 +84,7 @@ void C_SecureFault_Handler(void)
      * Returning from this exception could allow a pending NS exception to be
      * taken, so the current solution is to panic.
      */
+    rtc_wdt_security_fault(SCB->SFAR);
     tfm_core_panic();
 }
 

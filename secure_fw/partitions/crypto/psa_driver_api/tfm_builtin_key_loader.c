@@ -5,6 +5,22 @@
  *
  */
 #include <string.h>
+#include "puf_vault.h"
+
+/* Called by the PSA slot lookup on every key use. Volatile platform RAM keys
+ * (0x7FFF816B..0x7FFF8173) are only usable while the retained vault belongs to
+ * the current enrollment, is marked stable, and has not latched a tamper. */
+int tfm_platform_ram_key_usable(uint32_t key_id)
+{
+    const tfm_noinit_vault_t *vault = (const tfm_noinit_vault_t *)PUF_VAULT_ADDR;
+
+    if (key_id < 0x7FFF816BU || key_id > 0x7FFF8173U) {
+        return 1;
+    }
+    return puf_vault_ram_huk_valid(vault);
+}
+
+
 #include "tfm_builtin_key_loader.h"
 #include "tfm_mbedcrypto_include.h"
 #include "psa_manifest/pid.h"
@@ -211,6 +227,11 @@ psa_status_t tfm_builtin_key_loader_init(void)
     psa_key_type_t type;
 
     for (size_t key = 0; key < number_of_keys; key++) {
+        if (desc_table[key].slot_number == TFM_BUILTIN_KEY_SLOT_RAM_HUK) {
+            /* Loaded lazily after the platform PUF status IOCTL validates the
+             * vault against the current enrollment header. */
+            continue;
+        }
         if ((desc_table[key].lifetime != TFM_BUILTIN_KEY_LOADER_LIFETIME)
 #if defined(CC3XX_CRYPTO_OPAQUE_KEYS)
             && (desc_table[key].lifetime != CC3XX_OPAQUE_KEY_LIFETIME)
@@ -251,6 +272,69 @@ psa_status_t tfm_builtin_key_loader_init(void)
     return err;
 }
 
+
+/* Drop the lazily loaded descriptor slot for a key whose vault no longer
+ * authenticates, so the next use must reconstruct it through the strict
+ * puf_vault_ram_huk_valid() check instead of reusing cached bytes. */
+void tfm_platform_ram_key_evict(uint32_t key_id)
+{
+    const tfm_plat_builtin_key_descriptor_t *desc_table = NULL;
+    size_t number_of_keys = tfm_plat_builtin_key_get_desc_table_ptr(&desc_table);
+
+    for (size_t key = 0; key < number_of_keys; key++) {
+        if (desc_table[key].key_id == key_id) {
+            memset(&g_builtin_key_slots[desc_table[key].slot_number], 0,
+                   sizeof(g_builtin_key_slots[desc_table[key].slot_number]));
+            return;
+        }
+    }
+}
+
+
+static psa_status_t tfm_builtin_key_loader_load_slot(psa_drv_slot_number_t slot_number)
+{
+    const tfm_plat_builtin_key_descriptor_t *desc_table = NULL;
+    size_t number_of_keys = tfm_plat_builtin_key_get_desc_table_ptr(&desc_table);
+
+    for (size_t key = 0; key < number_of_keys; key++) {
+        uint8_t buf[TFM_BUILTIN_MAX_KEY_LEN];
+        size_t key_len = 0;
+        psa_key_bits_t key_bits = 0;
+        psa_algorithm_t algorithm = 0;
+        psa_key_type_t type = 0;
+        psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+        tfm_crypto_library_key_id_t key_id;
+        enum tfm_plat_err_t plat_err;
+
+        if (desc_table[key].slot_number != slot_number ||
+            desc_table[key].lifetime != TFM_BUILTIN_KEY_LOADER_LIFETIME) {
+            continue;
+        }
+
+        plat_err = desc_table[key].loader_key_func(desc_table[key].loader_key_ctx, buf,
+                                                   sizeof(buf), &key_len, &key_bits,
+                                                   &algorithm, &type);
+        if (plat_err != TFM_PLAT_ERR_SUCCESS) {
+            return PSA_ERROR_DOES_NOT_EXIST;
+        }
+
+        key_id = tfm_crypto_library_key_id_init(0, desc_table[key].key_id);
+        psa_set_key_id(&attr, key_id);
+        psa_set_key_bits(&attr, key_bits);
+        psa_set_key_algorithm(&attr, algorithm);
+        psa_set_key_type(&attr, type);
+        psa_set_key_lifetime(&attr, desc_table[key].lifetime);
+
+        memcpy(&g_builtin_key_slots[slot_number].attr, &attr, sizeof(attr));
+        memcpy(g_builtin_key_slots[slot_number].key, buf, key_len);
+        g_builtin_key_slots[slot_number].key_len = key_len;
+        g_builtin_key_slots[slot_number].is_loaded = 1;
+        return PSA_SUCCESS;
+    }
+
+    return PSA_ERROR_DOES_NOT_EXIST;
+}
+
 psa_status_t tfm_builtin_key_loader_get_key_buffer_size(
         tfm_crypto_library_key_id_t key_id, size_t *len)
 {
@@ -266,6 +350,21 @@ psa_status_t tfm_builtin_key_loader_get_key_buffer_size(
 
     err = builtin_key_get_slot(CRYPTO_LIBRARY_GET_KEY_ID(key_id), &slot_number);
     if (err != PSA_SUCCESS) {
+        goto wrap_up;
+    }
+
+    if (slot_number == TFM_BUILTIN_KEY_SLOT_RAM_HUK) {
+        /* The PUF vault may be reconstructed by the platform status
+         * IOCTL after boot. Only report the fixed size while the vault
+         * passes the strict stable/no-tamper check; the key is loaded
+         * on first use (tfm_builtin_key_loader_get_key).
+         */
+        if (!puf_vault_ram_huk_valid((const tfm_noinit_vault_t *)PUF_VAULT_ADDR)) {
+            err = PSA_ERROR_DOES_NOT_EXIST;
+            goto wrap_up;
+        }
+        *len = PUF_RAM_HUK_BYTES;
+        err = PSA_SUCCESS;
         goto wrap_up;
     }
 
@@ -291,8 +390,18 @@ psa_status_t tfm_builtin_key_loader_get_builtin_key(
 
     key_slot = &g_builtin_key_slots[slot_number];
 
-    /* The request is for a valid slot that has not been loaded*/
+    /* Platform keys can appear after boot (the PUF vault is reconstructed by the
+     * platform status IOCTL), so load a missing slot on first use. */
     if (!key_slot->is_loaded) {
+        err = tfm_builtin_key_loader_load_slot(slot_number);
+        if (err != PSA_SUCCESS) {
+            goto wrap_up;
+        }
+        key_slot = &g_builtin_key_slots[slot_number];
+    }
+    if (slot_number == TFM_BUILTIN_KEY_SLOT_RAM_HUK &&
+        !puf_vault_ram_huk_valid((const tfm_noinit_vault_t *)PUF_VAULT_ADDR)) {
+        memset(key_slot, 0, sizeof(*key_slot));
         err = PSA_ERROR_DOES_NOT_EXIST;
         goto wrap_up;
     }

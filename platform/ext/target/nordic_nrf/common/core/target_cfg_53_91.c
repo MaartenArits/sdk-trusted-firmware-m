@@ -29,6 +29,8 @@
 #endif
 
 #include <spu.h>
+/* Implemented in tfm_boards/src/rtc_wdt_tfm.c. */
+void rtc_wdt_platform_init(void);
 #include <nrfx.h>
 #include <nrfx_nvmc.h>
 #include <hal/nrf_gpio.h>
@@ -48,29 +50,53 @@
 
 extern const struct memory_region_limits memory_regions;
 
+#ifndef PRODUCTION_LOCK
+/* Development/bench default: APPROTECT is open so a true nRESET never bricks
+ * SWD/RTT. Production images pass -DPRODUCTION_LOCK=1. */
+#define PRODUCTION_LOCK 1
+#endif
+
+#define APPROTECT_HW_DISABLED 0x50FA50FAUL
+
 static inline enum tfm_plat_err_t configure_approtect_nvmc(void)
 {
 #if defined(NRF_APPROTECT)
 	/* For nRF53 and nRF91x1 already active. For nRF9160, active in the next boot.*/
-	if (nrfx_nvmc_word_writable_check((uint32_t)&NRF_UICR_S->APPROTECT,
-					  UICR_APPROTECT_PALL_Protected)) {
-		nrfx_nvmc_word_write((uint32_t)&NRF_UICR_S->APPROTECT,
-				     UICR_APPROTECT_PALL_Protected);
+	uint32_t value = PRODUCTION_LOCK ? UICR_APPROTECT_PALL_Protected
+					 : APPROTECT_HW_DISABLED;
+	if (NRF_UICR_S->APPROTECT == value ||
+	    (PRODUCTION_LOCK &&
+	     NRF_UICR_S->APPROTECT == APPROTECT_HW_DISABLED)) {
+		/* Already programmed (a DEVELOPMENT image may leave UICR open). */
+	} else if (nrfx_nvmc_word_writable_check((uint32_t)&NRF_UICR_S->APPROTECT,
+						value)) {
+		nrfx_nvmc_word_write((uint32_t)&NRF_UICR_S->APPROTECT, value);
 	} else {
 		return TFM_PLAT_ERR_SYSTEM_ERR;
 	}
 #endif
 #if defined(NRF_SECURE_APPROTECT)
 	/* For nRF53 and nRF91x1 already active. For nRF9160, active in the next boot. */
-	if (nrfx_nvmc_word_writable_check((uint32_t)&NRF_UICR_S->SECUREAPPROTECT,
-					  UICR_SECUREAPPROTECT_PALL_Protected)) {
-		nrfx_nvmc_word_write((uint32_t)&NRF_UICR_S->SECUREAPPROTECT,
-				     UICR_SECUREAPPROTECT_PALL_Protected);
+	uint32_t value = PRODUCTION_LOCK ? UICR_SECUREAPPROTECT_PALL_Protected
+					 : APPROTECT_HW_DISABLED;
+	if (NRF_UICR_S->SECUREAPPROTECT == value ||
+	    (PRODUCTION_LOCK &&
+	     NRF_UICR_S->SECUREAPPROTECT == APPROTECT_HW_DISABLED)) {
+		/* Already programmed (a DEVELOPMENT image may leave UICR open). */
+	} else if (nrfx_nvmc_word_writable_check(
+			   (uint32_t)&NRF_UICR_S->SECUREAPPROTECT, value)) {
+		nrfx_nvmc_word_write((uint32_t)&NRF_UICR_S->SECUREAPPROTECT, value);
 	} else {
 		return TFM_PLAT_ERR_SYSTEM_ERR;
 	}
 #endif
 
+#if !PRODUCTION_LOCK
+#if defined(NRF_APPROTECT_S)
+	NRF_APPROTECT_S->APPROTECT.DISABLE = APPROTECT_HW_DISABLED;
+	NRF_APPROTECT_S->SECUREAPPROTECT.DISABLE = APPROTECT_HW_DISABLED;
+#endif
+#endif
 	return TFM_PLAT_ERR_SUCCESS;
 }
 
@@ -182,7 +208,7 @@ enum tfm_plat_err_t spu_init_cfg(void)
 				 SPU_SECURE_ATTR_NONSECURE, perm, SPU_LOCK_CONF_LOCKED);
 
 	spu_regions_sram_config(NS_DATA_START, NS_DATA_LIMIT, SPU_SECURE_ATTR_NONSECURE, perm,
-				SPU_LOCK_CONF_LOCKED);
+				SPU_LOCK_CONF_UNLOCKED);
 
 	/* Configures veneers region to be non-secure callable */
 	spu_regions_flash_config_non_secure_callable(memory_regions.veneer_base,
@@ -367,7 +393,8 @@ static void peripheral_configuration(void)
 		NRF_TIMER0_S_BASE,
 		NRF_TIMER1_S_BASE,
 		NRF_TIMER2_S_BASE,
-		NRF_RTC0_S_BASE,
+		/* RTC0 is secure: the PUF platform partition uses it for
+		 * the discharge gate. RTC1 stays non-secure for Zephyr. */
 		NRF_RTC1_S_BASE,
 		NRF_DPPIC_S_BASE,
 #ifndef PSA_API_TEST_IPC
@@ -438,17 +465,27 @@ static void peripheral_configuration(void)
 #ifdef NRF_USBREGULATOR
 		NRF_USBREGULATOR_S_BASE,
 #endif /* NRF_USBREGULATOR */
-		NRF_NVMC_S_BASE,
 		NRF_P0_S_BASE,
 #ifdef NRF_P1
 		NRF_P1_S_BASE,
 #endif /*NRF_P1 */
-		NRF_VMC_S_BASE
+		/* NVMC is secure: TF-M ITS and the PUF platform partition
+		 * own the flash controller. */
+		/* VMC is secure: the PUF platform partition controls
+		 * RAM[1].S2; the vault lives in RAM[1].S1. */
 	};
 
 	for (int i = 0; i < ARRAY_SIZE(target_peripherals); i++) {
 		spu_peripheral_config_non_secure(target_peripherals[i], SPU_LOCK_CONF_UNLOCKED);
 	}
+
+	/* PUF platform secure peripherals: B0 hands NVMC to the non-secure
+	 * MCUboot, then TF-M re-secures NVMC/VMC/RTC0 for ITS and the PUF
+	 * platform partition. Keep the configuration unlocked so the next
+	 * reset's B0 can hand NVMC over again. */
+	spu_peripheral_config_secure(NRF_RTC0_S_BASE, SPU_LOCK_CONF_UNLOCKED);
+	spu_peripheral_config_secure(NRF_NVMC_S_BASE, SPU_LOCK_CONF_UNLOCKED);
+	spu_peripheral_config_secure(NRF_VMC_S_BASE, SPU_LOCK_CONF_UNLOCKED);
 }
 
 enum tfm_plat_err_t spu_periph_init_cfg(void)
@@ -459,6 +496,18 @@ enum tfm_plat_err_t spu_periph_init_cfg(void)
 	 * will be configured as secure later in the tfm_hal_bind_boundary function.
 	 */
 	peripheral_configuration();
+	/* The RTC/WDT time base and NVMC are Secure-only. RTC1 stays
+	 * Non-Secure for the Zephyr tick; CLOCK/POWER remain on the platform
+	 * attribution so the Non-Secure clock driver can start. */
+	spu_peripheral_config_secure(NRF_RTC0_S_BASE, SPU_LOCK_CONF_LOCKED);
+#ifdef NRF_WDT0_S_BASE
+	spu_peripheral_config_secure(NRF_WDT0_S_BASE, SPU_LOCK_CONF_LOCKED);
+#endif
+#ifdef NRF_WDT1_S_BASE
+	spu_peripheral_config_secure(NRF_WDT1_S_BASE, SPU_LOCK_CONF_LOCKED);
+#endif
+	spu_peripheral_config_secure(NRF_NVMC_S_BASE, SPU_LOCK_CONF_LOCKED);
+	rtc_wdt_platform_init();
 	dppi_channel_configuration();
 	gpio_configuration();
 	cache_configuration();

@@ -112,7 +112,7 @@ CHECK_ALIGNMENT_256(S_CODE_START)
  */ \
 .gnu.sgstubs TFM_LINKER_VENEERS_START : \
 { \
-    *(.gnu.sgstubs*) \
+    *(SORT_BY_NAME(.gnu.sgstubs*)) \
 } > FLASH :flash \
 /* GCC always places veneers at the end of .gnu.sgstubs section, so the only \
  * way to align the end of .gnu.sgstubs section is to align start of the \
@@ -686,6 +686,45 @@ SECTIONS
     Image$$ER_PART_RT_POOL$$ZI$$Limit = __partition_runtime_end__;
     Image$$ER_SERV_RT_POOL$$ZI$$Base = __service_runtime_start__;
     Image$$ER_SERV_RT_POOL$$ZI$$Limit = __service_runtime_end__;
+
+    /*
+     * PUF vault and switched RAM at the top of secure RAM. They stay inside
+     * the PSA RoT privileged data region so the platform partition and the
+     * built-in-key loader can address the fixed vault. RAM[1].S2 is split into
+     * the transient scratch arena (lower 4 KB) and the PUF response (upper
+     * 4 KB); powering S2 off destroys both halves.
+     */
+    .tfm_noinit_vault (ORIGIN(RAM) + LENGTH(RAM) - 0x2400) (NOLOAD) : ALIGN(8)
+    {
+        __tfm_noinit_vault_start__ = .;
+        KEEP(*(.tfm_noinit_vault))
+        . = ALIGN(8);
+        KEEP(*(.tfm_noinit_vault.rtc))
+        . = ALIGN(8);
+        __tfm_noinit_vault_end__ = .;
+    } > RAM
+    ASSERT(SIZEOF(.tfm_noinit_vault) <= 0x400, "PUF vault overflow")
+    ASSERT(ADDR(.tfm_noinit_vault) == 0x2000BC00, "PUF vault address")
+    ASSERT(g_rtc_persistent_vault == 0x2000BE98, "RTC vault address")
+
+    .puf_scratch (ORIGIN(RAM) + LENGTH(RAM) - 0x2000) (NOLOAD) : ALIGN(8)
+    {
+        __puf_scratch_start__ = .;
+        KEEP(*(.puf_scratch))
+        . = ORIGIN(RAM) + LENGTH(RAM) - 0x1000;
+        __puf_scratch_end__ = .;
+    } > RAM
+    ASSERT(ADDR(.puf_scratch) == 0x2000C000, "PUF scratch address")
+    ASSERT(SIZEOF(.puf_scratch) == 0x1000, "PUF scratch size")
+
+    .tfm_puf_bank (ORIGIN(RAM) + LENGTH(RAM) - 0x1000) (NOLOAD) :
+    {
+        __tfm_puf_bank_start__ = .;
+        . = . + 0x1000;
+        __tfm_puf_bank_end__ = .;
+    } > RAM
+    ASSERT(ADDR(.tfm_puf_bank) == 0x2000D000, "PUF bank address")
+    ASSERT(SIZEOF(.tfm_puf_bank) == 0x1000, "PUF bank size")
 
     /* Position tag: End of PSA RoT data (privileged) */
     . = ALIGN(TFM_LINKER_PT_PSA_ROT_DATA_ALIGNMENT);

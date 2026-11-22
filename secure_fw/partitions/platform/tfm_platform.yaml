@@ -1,5 +1,6 @@
 #-------------------------------------------------------------------------------
 # Copyright (c) 2018-2022, Arm Limited. All rights reserved.
+# Copyright (c) 2026 Nordic Semiconductor ASA.
 #
 # SPDX-License-Identifier: BSD-3-Clause
 #
@@ -24,4 +25,8 @@
       "version_policy": "STRICT"
     },
   ],
+  "dependencies": [
+    "TFM_CRYPTO",
+    "TFM_INTERNAL_TRUSTED_STORAGE_SERVICE"
+  ]
 }
